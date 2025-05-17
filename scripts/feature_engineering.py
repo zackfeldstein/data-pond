@@ -6,7 +6,13 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 import os
 import sys
-sys.path.append('../')
+
+# Add the current directory to the path if it's not already there
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 from scripts.minio_utils import save_df_to_minio
 
 def identify_column_types(df):

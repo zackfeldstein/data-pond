@@ -9,9 +9,23 @@ import signal
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import torch
 
-# Add the parent directory to the path
-sys.path.append('../')
+# Force CUDA to be used at script startup
+if torch.cuda.is_available():
+    print("FORCING CUDA USAGE AT STARTUP")
+    # Set PyTorch to use CUDA
+    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # Force all tensors to be created on GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    # Set PyTorch to use GPU by default
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+
+# Add the current directory to the path if it's not already there
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 from scripts.minio_utils import get_minio_client, list_datasets, list_files_in_dataset, read_csv_from_minio
 from scripts.feature_engineering import engineer_features, split_data
@@ -131,55 +145,136 @@ def run_pipeline(dataset_name, use_gpu=False, run_serving=True):
     
     print(f"Detected problem type: {problem_type}")
     
-    # 7. Set up MLflow
-    experiment_id = setup_mlflow()
+    # 7. Set up MLflow (optional)
+    try:
+        experiment_id = setup_mlflow()
+        mlflow_available = experiment_id is not None
+    except Exception as e:
+        print(f"MLflow setup failed: {e}")
+        print("Continuing without MLflow...")
+        experiment_id = None
+        mlflow_available = False
     
-    # 8. Train models
-    print("\n\nTraining scikit-learn model...")
-    sklearn_model = train_sklearn_model(
-        X_train, y_train, X_test, y_test, 
-        problem_type=problem_type,
-        model_type='rf'
-    )
+    # 8. Train PyTorch model
+    print("\n\nTraining PyTorch model...")
+    # Create a validation set from test set
+    X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5, random_state=42)
     
-    # If GPU is available and requested, train PyTorch model
+    # Forced GPU usage if requested
     if use_gpu:
-        print("\n\nTraining PyTorch model on GPU...")
-        # Create a validation set from test set
-        X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5, random_state=42)
-        
-        pytorch_model, val_loss = train_pytorch_model(
-            X_train, y_train, X_val, y_val,
-            problem_type=problem_type,
-            device='cuda:0',  # Use GPU
-            epochs=50,
-            batch_size=32
-        )
+        if torch.cuda.is_available():
+            # Really make sure we're using CUDA
+            print("FORCING CUDA FOR MODEL TRAINING")
+            # Set environment variables
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            # Empty cache
+            torch.cuda.empty_cache()
+            # Create a CUDA device and set as default
+            device = torch.device('cuda:0')
+            # Set default tensor type to CUDA
+            torch.set_default_tensor_type('torch.cuda.FloatTensor')
+            
+            # Print GPU information
+            print(f"GPU device being used: {torch.cuda.get_device_name(0)}")
+            print(f"Is CUDA initialized: {torch.cuda.is_initialized()}")
+            print(f"CUDA version: {torch.version.cuda}")
+            print(f"Current device: {torch.cuda.current_device()}")
+            
+            # Create a test tensor to verify GPU is working
+            test_tensor = torch.tensor([1.0, 2.0, 3.0])
+            print(f"Test tensor device: {test_tensor.device}")
+            
+            # Move test tensor to GPU explicitly
+            test_tensor = test_tensor.cuda()
+            print(f"Test tensor after .cuda(): {test_tensor.device}")
+        else:
+            print("WARNING: GPU requested but CUDA is not available. Using CPU instead.")
+            device = torch.device('cpu')
+    else:
+        device = torch.device('cpu')
     
-    # 9. Register the model in MLflow Registry
-    print("\n\nRegistering model in MLflow Model Registry...")
-    model_name = f"{dataset_name}_{problem_type}_model"
+    print(f"FINAL DEVICE SELECTION: {device}")
     
-    with mlflow.start_run(experiment_id=experiment_id):
-        # Log scikit-learn model
-        mlflow.sklearn.log_model(
-            sklearn_model, 
-            "model",
-            registered_model_name=model_name
-        )
+    # Convert the data to better format for PyTorch if needed
+    if isinstance(X_train, pd.DataFrame):
+        # Ensure all columns are numeric to avoid the "setting an array element with a sequence" error
+        X_train_numeric = X_train.apply(pd.to_numeric, errors='coerce').fillna(0)
+        X_val_numeric = X_val.apply(pd.to_numeric, errors='coerce').fillna(0)
+        X_test_numeric = X_test.apply(pd.to_numeric, errors='coerce').fillna(0)
+    else:
+        X_train_numeric = X_train
+        X_val_numeric = X_val
+        X_test_numeric = X_test
     
-    # 10. Promote model to Production
-    print("\n\nPromoting model to Production...")
-    client = mlflow.tracking.MlflowClient()
-    latest_version = client.get_latest_versions(model_name, stages=['None'])[0].version
-    
-    client.transition_model_version_stage(
-        name=model_name,
-        version=latest_version,
-        stage='Production'
+    pytorch_model, val_loss = train_pytorch_model(
+        X_train_numeric, y_train, X_val_numeric, y_val,
+        problem_type=problem_type,
+        device=device,
+        epochs=50,
+        batch_size=32
     )
     
-    print(f"Model {model_name} version {latest_version} promoted to Production")
+    # 9. Handle model registration if MLflow is available
+    model_name = f"{dataset_name}_{problem_type}_pytorch_model"
+    latest_version = None
+    
+    if mlflow_available:
+        print("\n\nRegistering model in MLflow Model Registry...")
+        
+        try:
+            with mlflow.start_run(experiment_id=experiment_id):
+                # Log PyTorch model
+                print(f"Logging PyTorch model as '{model_name}'")
+                mlflow.pytorch.log_model(
+                    pytorch_model, 
+                    "model",
+                    registered_model_name=model_name
+                )
+                print("Model logged successfully")
+        except Exception as e:
+            print(f"Error logging model to MLflow: {e}")
+            print("Continuing with pipeline without MLflow model registration...")
+            mlflow_available = False
+    else:
+        print("Skipping MLflow model registration (MLflow not available)")
+    
+    # 10. Promote model to Production if MLflow is available
+    if mlflow_available:
+        try:
+            print("\n\nPromoting model to Production...")
+            client = mlflow.tracking.MlflowClient()
+            
+            # Get latest model version
+            try:
+                latest_versions = client.get_latest_versions(model_name, stages=['None'])
+                if latest_versions:
+                    latest_version = latest_versions[0].version
+                    
+                    # Transition to production
+                    client.transition_model_version_stage(
+                        name=model_name,
+                        version=latest_version,
+                        stage='Production'
+                    )
+                    print(f"Model {model_name} version {latest_version} promoted to Production")
+                else:
+                    print(f"No versions found for model {model_name}")
+            except Exception as e:
+                print(f"Error retrieving model versions: {e}")
+        except Exception as e:
+            print(f"Error promoting model to production: {e}")
+    else:
+        print("Skipping model promotion (MLflow not available)")
+        
+    # Save model locally as backup if MLflow failed
+    if not mlflow_available:
+        try:
+            local_model_path = f"models/{model_name}.pt"
+            print(f"Saving model locally to {local_model_path}")
+            torch.save(pytorch_model.state_dict(), local_model_path)
+            print("Model saved successfully")
+        except Exception as e:
+            print(f"Error saving model locally: {e}")
     
     # 11. Start model serving if requested
     serving_process = None
@@ -190,7 +285,12 @@ def run_pipeline(dataset_name, use_gpu=False, run_serving=True):
             print("You can test it with a sample prediction:")
             
             # Sample data for prediction (first row of test set)
-            sample_data = X_test.iloc[0].to_dict()
+            if isinstance(X_test_numeric, pd.DataFrame):
+                sample_data = X_test_numeric.iloc[0].to_dict()
+            else:
+                # If not a DataFrame, convert to dict with feature indices as keys
+                sample_data = {f"feature_{i}": val for i, val in enumerate(X_test_numeric[0])}
+                
             request_data = {
                 "model_name": model_name,
                 "model_stage": "Production",
@@ -198,12 +298,10 @@ def run_pipeline(dataset_name, use_gpu=False, run_serving=True):
             }
             
             print("\nAPI request example:")
-            print(f"curl -X POST http://localhost:8000/predict \\
-                -H \"Content-Type: application/json\" \\
-                -d '{request_data}'")
+            print(f"curl -X POST http://localhost:8000/predict -H \"Content-Type: application/json\" -d '{request_data}'")
     
     print("\n\nPipeline execution complete!")
-    print(f"MLflow UI: http://localhost:5000")
+    print(f"MLflow UI: http://localhost:8080")
     if serving_process:
         print(f"Model Serving API: http://localhost:8000")
         print("Press Ctrl+C to stop the servers")
@@ -223,15 +321,19 @@ def main():
     parser.add_argument('--dataset', type=str, required=True, help='Name of the dataset in MinIO')
     parser.add_argument('--gpu', action='store_true', help='Use GPU for PyTorch model training')
     parser.add_argument('--no-serving', action='store_true', help='Skip starting the model serving API')
+    parser.add_argument('--start-mlflow', action='store_true', help='Start MLflow server (not needed if already running)')
     
     args = parser.parse_args()
     
-    # Start MLflow server
-    mlflow_process = start_mlflow_server()
-    
-    if mlflow_process is None:
-        print("Failed to start MLflow server. Exiting.")
-        return
+    mlflow_process = None
+    # Only start MLflow server if explicitly requested
+    if args.start_mlflow:
+        mlflow_process = start_mlflow_server()
+        if mlflow_process is None:
+            print("Failed to start MLflow server. Exiting.")
+            return
+    else:
+        print("Using existing MLflow server at http://localhost:8080")
     
     try:
         # Run the pipeline

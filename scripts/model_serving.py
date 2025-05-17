@@ -4,11 +4,18 @@ import mlflow
 import pandas as pd
 import numpy as np
 import json
+import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, Union
 from contextlib import asynccontextmanager
-sys.path.append('../')
+
+# Add the current directory to the path if it's not already there
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 from scripts.mlflow_utils import load_model
 
 # Preloaded models dictionary
@@ -82,18 +89,55 @@ async def predict(request: PredictionRequest):
         # Convert input features to DataFrame
         features_df = pd.DataFrame([request.features])
         
-        # Make prediction
-        prediction = models[model_key].predict(features_df)
-        
-        # Get prediction probabilities if available (for classification)
-        if hasattr(models[model_key], 'predict_proba'):
-            probabilities = models[model_key].predict_proba(features_df).tolist()
-            return {
-                "prediction": prediction.tolist()[0],
-                "probabilities": probabilities[0]
-            }
+        # Check if it's a PyTorch model
+        if isinstance(models[model_key], torch.nn.Module):
+            # PyTorch model inference
+            import torch
+            
+            # Convert to tensor
+            features_tensor = torch.FloatTensor(features_df.values)
+            
+            # Set model to evaluation mode
+            models[model_key].eval()
+            
+            # Make prediction
+            with torch.no_grad():
+                output = models[model_key](features_tensor)
+                
+                # Check model type
+                if hasattr(models[model_key], 'layers') and isinstance(models[model_key].layers[-1], torch.nn.Linear):
+                    output_dim = models[model_key].layers[-1].out_features
+                    
+                    if output_dim == 1:  # Binary classification or regression
+                        # Check if it's classification (should have sigmoid in forward)
+                        if "classifier" in model_key.lower() or "classification" in model_key.lower():
+                            prediction = torch.sigmoid(output).item() > 0.5
+                            return {
+                                "prediction": int(prediction),
+                                "confidence": float(torch.sigmoid(output).item())
+                            }
+                        else:  # Regression
+                            return {"prediction": float(output.item())}
+                    else:  # Multi-class classification
+                        probabilities = torch.softmax(output, dim=1).tolist()[0]
+                        prediction = int(torch.argmax(output, dim=1).item())
+                        return {
+                            "prediction": prediction,
+                            "probabilities": probabilities
+                        }
         else:
-            return {"prediction": prediction.tolist()[0]}
+            # scikit-learn model inference
+            prediction = models[model_key].predict(features_df)
+            
+            # Get prediction probabilities if available (for classification)
+            if hasattr(models[model_key], 'predict_proba'):
+                probabilities = models[model_key].predict_proba(features_df).tolist()
+                return {
+                    "prediction": prediction.tolist()[0],
+                    "probabilities": probabilities[0]
+                }
+            else:
+                return {"prediction": prediction.tolist()[0]}
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
@@ -113,18 +157,56 @@ async def batch_predict(request: BatchPredictionRequest):
         # Convert input features to DataFrame
         features_df = pd.DataFrame(request.features)
         
-        # Make prediction
-        predictions = models[model_key].predict(features_df)
-        
-        # Get prediction probabilities if available (for classification)
-        if hasattr(models[model_key], 'predict_proba'):
-            probabilities = models[model_key].predict_proba(features_df).tolist()
-            return {
-                "predictions": predictions.tolist(),
-                "probabilities": probabilities
-            }
+        # Check if it's a PyTorch model
+        if isinstance(models[model_key], torch.nn.Module):
+            # PyTorch model inference
+            import torch
+            
+            # Convert to tensor
+            features_tensor = torch.FloatTensor(features_df.values)
+            
+            # Set model to evaluation mode
+            models[model_key].eval()
+            
+            # Make prediction
+            with torch.no_grad():
+                outputs = models[model_key](features_tensor)
+                
+                # Check model type
+                if hasattr(models[model_key], 'layers') and isinstance(models[model_key].layers[-1], torch.nn.Linear):
+                    output_dim = models[model_key].layers[-1].out_features
+                    
+                    if output_dim == 1:  # Binary classification or regression
+                        # Check if it's classification
+                        if "classifier" in model_key.lower() or "classification" in model_key.lower():
+                            predictions = (torch.sigmoid(outputs) > 0.5).int().tolist()
+                            confidences = torch.sigmoid(outputs).tolist()
+                            return {
+                                "predictions": predictions,
+                                "confidences": confidences
+                            }
+                        else:  # Regression
+                            return {"predictions": outputs.flatten().tolist()}
+                    else:  # Multi-class classification
+                        probabilities = torch.softmax(outputs, dim=1).tolist()
+                        predictions = torch.argmax(outputs, dim=1).tolist()
+                        return {
+                            "predictions": predictions,
+                            "probabilities": probabilities
+                        }
         else:
-            return {"predictions": predictions.tolist()}
+            # scikit-learn model inference
+            predictions = models[model_key].predict(features_df)
+            
+            # Get prediction probabilities if available (for classification)
+            if hasattr(models[model_key], 'predict_proba'):
+                probabilities = models[model_key].predict_proba(features_df).tolist()
+                return {
+                    "predictions": predictions.tolist(),
+                    "probabilities": probabilities
+                }
+            else:
+                return {"predictions": predictions.tolist()}
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch prediction error: {str(e)}")
